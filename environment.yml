@@ -1,4 +1,7 @@
 name: multimodal
+channels:
+  - defaults
+  - conda-forge
 dependencies:
   - python==3.7.4
   - tensorflow-gpu==1.14.0
@@ -8,6 +11,11 @@ dependencies:
   - keras==2.2.4
   - h5py==2.9.0
   - xlrd==1.2.0
+  - tslearn==0.2.5
   - jupyterlab
+  - pytest
+  - tqdm
   - pip
+  - pip:
+      - -e .
   
