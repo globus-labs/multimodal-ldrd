@@ -2,6 +2,7 @@ from multimodal.sklearn import NMFWithDTW
 from pytest import fixture
 import numpy as np
 
+
 @fixture
 def signal() -> np.ndarray:
     x = np.linspace(0, 10, 64)
