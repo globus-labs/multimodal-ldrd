@@ -2,6 +2,7 @@
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+from tqdm import tqdm
 from keras.models import Model
 from keras import backend as K
 from keras.layers import Layer
@@ -149,7 +150,8 @@ class SingleModalFactorization(Layer):
 def run_training(factorizer: Model, signal: np.ndarray, max_epochs: int,
                  steps_per_epoch: int = 8,
                  early_stopping_patience: int = 20,
-                 early_stopping_tolerance: float = 1e-6) -> pd.DataFrame:
+                 early_stopping_tolerance: float = 1e-6,
+                 verbose=False) -> pd.DataFrame:
     """Train the factorization model
 
     Args:
@@ -161,6 +163,7 @@ def run_training(factorizer: Model, signal: np.ndarray, max_epochs: int,
             by ``early_stopping_tolerance``
         early_stopping_tolerance (float): Absolute tolerance for early stopping.
             Loss must improved by more than this value before patience runs out
+        verbose (bool): Whether to display a progress bar
     Returns:
         (pd.DataFrame) Loss as a function of epoch
     """
@@ -171,7 +174,9 @@ def run_training(factorizer: Model, signal: np.ndarray, max_epochs: int,
     loss = 0
     best_loss = np.inf
     since_best = 0
-    for _ in range(max_epochs):
+    epoch_iter = tqdm(range(max_epochs), dynamic_ncols=True,
+                      disable=not verbose)
+    for _ in epoch_iter:
         # Run an epoch
         for _ in range(steps_per_epoch):
             loss = factorizer.train_on_batch(signal_tensor, signal_tensor)
@@ -184,5 +189,8 @@ def run_training(factorizer: Model, signal: np.ndarray, max_epochs: int,
             since_best = 0
         if since_best > early_stopping_patience:
             break
+
+        # Update the display
+        epoch_iter.set_postfix({'best_loss': best_loss, 'loss': loss})
     return pd.DataFrame.from_dict({'epoch': list(range(len(losses))),
                                    'loss': losses})
