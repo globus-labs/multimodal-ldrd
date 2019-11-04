@@ -13,16 +13,19 @@ class SingleModalFactorization(Layer):
     to shift across different measurements of the signal"""
 
     def __init__(self, n_components=2, fit_shift=False,
-                 regularizer=None, **kwargs):
+                 regularizer=None, subbatch_size=32, **kwargs):
         """
         Args:
              n_components (int): Number of components to learn
              fit_shift (bool): Whether to fit a shift on the
+             regularizer (Regularizer): Regularizer for all learnable parameters
+             subbatch_size (int): Number of samples to process concurrently
         """
         super().__init__(**kwargs)
         self.n_components = n_components
         self.fit_shift = fit_shift
         self.regularizer = regularizer
+        self.subbatch_size = subbatch_size
 
         # Placeholders for the weights
         self.components = self.contributions = self.shift = None
@@ -72,7 +75,7 @@ class SingleModalFactorization(Layer):
             for k in range(-self.n_channels, self.n_channels, 1):
                 kiu = np.triu_indices_from(k_matrix, k)
                 k_matrix[kiu] = k
-            k_matrix = K.constant(k_matrix)
+            k_matrix = K.constant(k_matrix[None, :, :])
 
             # Compute the shifts from each component
             shifted_components = []
@@ -82,22 +85,39 @@ class SingleModalFactorization(Layer):
                 my_contribution = self.contributions[:, c]  # shape: (n_samples)
 
                 # Shift each individual components
+                #  Note: We process samples in chunks because there are memory
+                #   limitations in TF that prevent running all samples concurrently
+                #   (protobuf's limit of 2GB message sizes) and processing samples
+                #   one-at-a-time is too slow (not much intra-operation parallelism)
+                #  The self.subbatch_size is a tuning parameter
                 my_shifted_components = []
-                for s in range(self.n_samples):
-                    my_shift = self.shift[s, c]  # shape: ()
+                sample_chunks = np.array_split(list(range(self.n_samples)),
+                                               self.n_samples //
+                                               self.subbatch_size)
+                for s_chunk in sample_chunks:
+                    # Get the shift values, tile to make ready for subtraction
+                    my_shift = tf.slice(self.shift,  # shape: (len(s_chunk),1 )
+                                        begin=(min(s_chunk), c),
+                                        size=(len(s_chunk), 1),
+                                        name=f'component_{c}-samples_'
+                                             f'{min(s_chunk)}-{max(s_chunk)}')
+                    my_shift = K.expand_dims(my_shift)
+                    my_shift = K.tile(my_shift, (1, 1, self.n_channels))
 
                     # Compute the distance from each point
-                    distance_matrix = K.abs(my_shift - k_matrix)
+                    k_matrix_tiled = K.tile(k_matrix, (len(s_chunk), 1, 1))
+                    distance_matrix = K.abs(k_matrix_tiled - my_shift)
                     coeff_matrix = K.clip(1 - distance_matrix, 0, 1)
 
                     # Compute the shift
-                    shifted_component = K.dot(coeff_matrix,
-                                              K.expand_dims(my_component, -1))
+                    tiled_component = K.reshape(my_component,
+                                                (1, self.n_channels, 1))
+                    shifted_component = tf.matmul(coeff_matrix, tiled_component)
                     my_shifted_components.append(K.squeeze(shifted_component, -1))
 
                 # Stack them to form: (n_samples, n_channels)
-                my_shifted_components = tf.stack(my_shifted_components,
-                                                 name=f'shifted_components_{c}')
+                my_shifted_components = tf.concat(my_shifted_components, axis=0,
+                                                  name=f'shifted_components_{c}')
 
                 # Multiply by the contribution ot each sample
                 my_shifted_contribution = tf.multiply(
