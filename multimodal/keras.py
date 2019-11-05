@@ -3,10 +3,63 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tqdm import tqdm
+from typing import List
 from keras.models import Model
 from keras import backend as K
 from keras.layers import Layer
 from keras.constraints import NonNeg
+from keras.regularizers import Regularizer
+
+
+class MultiRegularizer(Regularizer):
+    """Employ multiple regularizers"""
+
+    def __init__(self, regularizers: List[Regularizer]):
+        """
+        Args:
+             regularizers ([Regularizers]): Regularizers to sum together
+        """
+        super().__init__()
+        self.regularizers = regularizers
+
+    def __call__(self, x):
+        return sum(r(x) for r in self.regularizers)
+
+
+class ContinuityRegularizer(Regularizer):
+    """Applies a penalty to the change in weights along a certain axis
+
+    The regularization strength is equal to the sum of (x[i] - x[i-1])^2.
+    """
+
+    def __init__(self, weight: float, axis: int = -1):
+        """
+        Args:
+             weight (float): Strength of the regularization
+             axis (int): Axis along which to compute differences
+        """
+        super().__init__()
+        self.weight = weight
+        self.axis = axis
+
+    def __call__(self, x):
+        # Identify the desired diff axis
+        n_dim = K.ndim(x)
+        diff_axis = self.axis if self.axis != -1 else n_dim - 1
+
+        # Make two slices: one of [0, N-1] and another to [1, N] along the diff axis
+        slice_0 = [slice(None) for _ in range(n_dim)]
+        slice_0[diff_axis] = slice(0, -1)
+        slice_1 = [slice(None) for _ in range(n_dim)]
+        slice_1[diff_axis] = slice(1, None)
+
+        # Get the values along the slice axis
+        slice_0_values = x[slice_0]
+        slice_1_values = x[slice_1]
+
+        # Compute (x[i] - x[i-1]) * 2
+        penalty = K.pow(slice_0_values - slice_1_values, 2)
+        return self.weight * K.sum(penalty)
 
 
 class SingleModalFactorization(Layer):
@@ -14,18 +67,23 @@ class SingleModalFactorization(Layer):
     to shift across different measurements of the signal"""
 
     def __init__(self, n_components=2, fit_shift=False,
-                 regularizer=None, subbatch_size=32, **kwargs):
+                 component_regularizer=None, subbatch_size=32,
+                 contribution_regularizer=None,
+                 **kwargs):
         """
         Args:
              n_components (int): Number of components to learn
              fit_shift (bool): Whether to fit a shift on the
-             regularizer (Regularizer): Regularizer for all learnable parameters
+             component_regularizer (Regularizer): Regularizer for component signals
+             contribution_regularizer (Regularizer): Regularizer for the
+                contributions from component signals and shift factors
              subbatch_size (int): Number of samples to process concurrently
         """
         super().__init__(**kwargs)
         self.n_components = n_components
         self.fit_shift = fit_shift
-        self.regularizer = regularizer
+        self.component_regularizer = component_regularizer
+        self.contribution_regularizer = contribution_regularizer
         self.subbatch_size = subbatch_size
 
         # Placeholders for the weights
@@ -47,21 +105,21 @@ class SingleModalFactorization(Layer):
             shape=(self.n_components, self.n_channels),
             constraint=NonNeg(),
             initializer='uniform',
-            regularizer=self.regularizer
+            regularizer=self.component_regularizer
         )
         self.contributions = self.add_weight(
             name='contributions',
             shape=(self.n_samples, self.n_components),
             constraint=NonNeg(),
             initializer='uniform',
-            regularizer=self.regularizer
+            regularizer=self.contribution_regularizer
         )
         if self.fit_shift:
             self.shift = self.add_weight(
                 name='shift',
                 shape=(self.n_samples, self.n_components),
                 initializer='uniform',
-                regularizer=self.regularizer,
+                regularizer=self.contribution_regularizer,
             )
 
     def call(self, inputs, **kwargs):
