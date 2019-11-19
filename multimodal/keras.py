@@ -69,6 +69,7 @@ class SingleModalFactorization(Layer):
     def __init__(self, n_components=2, fit_shift=False,
                  component_regularizer=None, subbatch_size=32,
                  contribution_regularizer=None,
+                 shift_regularizer=None,
                  **kwargs):
         """
         Args:
@@ -76,7 +77,8 @@ class SingleModalFactorization(Layer):
              fit_shift (bool): Whether to fit a shift on the
              component_regularizer (Regularizer): Regularizer for component signals
              contribution_regularizer (Regularizer): Regularizer for the
-                contributions from component signals and shift factors
+                contributions from component signals
+             shift_regularizer (Regularizer): Regularizer for the shift factors
              subbatch_size (int): Number of samples to process concurrently
         """
         super().__init__(**kwargs)
@@ -84,6 +86,7 @@ class SingleModalFactorization(Layer):
         self.fit_shift = fit_shift
         self.component_regularizer = component_regularizer
         self.contribution_regularizer = contribution_regularizer
+        self.shift_regularizer = shift_regularizer
         self.subbatch_size = subbatch_size
 
         # Placeholders for the weights
@@ -119,7 +122,7 @@ class SingleModalFactorization(Layer):
                 name='shift',
                 shape=(self.n_samples, self.n_components),
                 initializer='uniform',
-                regularizer=self.contribution_regularizer,
+                regularizer=self.shift_regularizer,
             )
 
     def call(self, inputs, **kwargs):
