@@ -3,12 +3,117 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tqdm import tqdm
-from typing import List
 from keras.models import Model
 from keras import backend as K
 from keras.layers import Layer
 from keras.constraints import NonNeg
 from keras.regularizers import Regularizer
+from typing import List, Optional, Tuple
+
+
+def generate_signals(n_samples: int, n_components: int, n_channels: int,
+                     contributions: tf.Tensor, components: tf.Tensor, shift: Optional[tf.Tensor],
+                     subbatch_size: int = 32) -> Tuple[tf.Tensor, tf.Tensor]:
+    """Apply the operations to generate the output signal given the contributions, components and shifts
+
+    Args:
+        n_samples (int): Number of samples in the experiment being analyzed
+        n_channels (int): Number of channels in each signal
+        n_components (int): Number of components to learn from the data
+        contributions (tf.Tensor): Contribution level for each of the learned components
+        components (tf.Tensor): Values of each of the learned components
+        shift (tf.Tensor): Optional list of shift values
+        subbatch_size (int): Number of samples for which to compute shapes at once
+    Returns:
+        total_signal (tf.Tensor): Signal generated for each sample. Shape: n_samples, n_channels
+        per_sample_contributions (tf.Tensor): Component from each subshape. Shape: n_components, n_samples, n_channels
+    """
+    if shift is not None:
+        # Make a shift matrix
+        #  The shift matrix is a matrix where
+        #   shift[i, j] = j - i
+        #  Allows you to easily compute the distance of a specific
+        #  point from all points in a pattern. We can use that
+        #  distance to create interpolators
+        k_matrix = np.zeros((n_channels, n_channels))
+        for k in range(-n_channels, n_channels, 1):
+            kiu = np.triu_indices_from(k_matrix, k)
+            k_matrix[kiu] = k
+        k_matrix = K.constant(k_matrix[None, :, :])
+
+        # Compute the shifts from each component
+        shifted_components = []
+        for c in range(n_components):
+            # Get the component and the contribution
+            my_component = components[c, :]  # shape: (n_channels)
+            my_contribution = contributions[:, c]  # shape: (n_samples)
+
+            # Shift each individual components
+            #  Note: We process samples in chunks because there are memory
+            #   limitations in TF that prevent running all samples concurrently
+            #   (protobuf's limit of 2GB message sizes) and processing samples
+            #   one-at-a-time is too slow (not much intra-operation parallelism)
+            #  The self.subbatch_size is a tuning parameter
+            my_shifted_components = []
+            sample_chunks = np.array_split(list(range(n_samples)),
+                                           n_samples // subbatch_size)
+            for s_chunk in sample_chunks:
+                # Get the shift values, tile to make ready for subtraction
+                my_shift = tf.slice(shift,  # shape: (len(s_chunk),1 )
+                                    begin=(min(s_chunk), c),
+                                    size=(len(s_chunk), 1),
+                                    name=f'component_{c}-samples_'
+                                         f'{min(s_chunk)}-{max(s_chunk)}')
+                my_shift = K.expand_dims(my_shift)
+                my_shift = K.tile(my_shift, (1, 1, n_channels))
+
+                # Compute the distance from each point
+                k_matrix_tiled = K.tile(k_matrix, (len(s_chunk), 1, 1))
+                distance_matrix = K.abs(k_matrix_tiled - my_shift)
+                coeff_matrix = K.clip(1 - distance_matrix, 0, 1)
+
+                # Compute the shift
+                tiled_component = K.reshape(my_component,
+                                            (1, n_channels, 1))
+                shifted_component = tf.matmul(coeff_matrix, tiled_component)
+                my_shifted_components.append(K.squeeze(shifted_component, -1))
+
+            # Stack them to form: (n_samples, n_channels)
+            my_shifted_components = tf.concat(my_shifted_components, axis=0,
+                                              name=f'shifted_components_{c}')
+
+            # Multiply by the contribution ot each sample
+            my_shifted_contribution = tf.multiply(
+                my_shifted_components,
+                K.expand_dims(my_contribution, -1)
+            )
+            shifted_components.append(tf.stack(my_shifted_contribution))
+
+        # Stacked array has a shape: (n_components, n_samples, n_channels)
+        shifted_contributions = tf.stack(shifted_components, 0,
+                                         name='shifted_contributions')
+
+        # The total signal is the sum of all components
+        total_signal = K.sum(shifted_contributions, axis=0, keepdims=False)
+        return total_signal, shifted_contributions
+    else:
+        # Matrix multiply the contributes with the components
+        #  Contributions is: NS x NC
+        #  Components is: NC x NCh
+        # Result: NS x NCh
+        total_signal = K.dot(contributions, components)
+
+        # Compute the contribution of each signal
+        #  First expand the matrices so that broadcasting would work
+        #  Contributions: NS x NC -T> NC x NS -ex_dim-> NC x NS x 1
+        #  Components: NC x NCh -ex_dim-> NC x 1 x NCh
+        # Output shape: NC x NS x NCh
+        per_comp_contributions = tf.multiply(
+            tf.expand_dims(tf.transpose(contributions), -1),
+            tf.expand_dims(components, 1)
+        )
+
+        return total_signal, per_comp_contributions
 
 
 class MultiRegularizer(Regularizer):
@@ -91,7 +196,7 @@ class SingleModalFactorization(Layer):
 
         # Placeholders for the weights
         self.components = self.contributions = self.shift = None
-        self.shifted_contributions = None
+        self.per_sample_contribution = None
 
         # Placeholders for input shape information
         self.n_samples = self.n_channels = None
@@ -126,86 +231,34 @@ class SingleModalFactorization(Layer):
             )
 
     def call(self, inputs, **kwargs):
-        if self.fit_shift:
-            # Make a shift matrix
-            #  The shift matrix is a matrix where
-            #   shift[i, j] = j - i
-            #  Allows you to easily compute the distance of a specific
-            #  point from all points in a pattern. We can use that
-            #  distance to create interpolators
-            k_matrix = np.zeros((self.n_channels, self.n_channels))
-            for k in range(-self.n_channels, self.n_channels, 1):
-                kiu = np.triu_indices_from(k_matrix, k)
-                k_matrix[kiu] = k
-            k_matrix = K.constant(k_matrix[None, :, :])
-
-            # Compute the shifts from each component
-            shifted_components = []
-            for c in range(self.n_components):
-                # Get the component and the contribution
-                my_component = self.components[c, :]  # shape: (n_channels)
-                my_contribution = self.contributions[:, c]  # shape: (n_samples)
-
-                # Shift each individual components
-                #  Note: We process samples in chunks because there are memory
-                #   limitations in TF that prevent running all samples concurrently
-                #   (protobuf's limit of 2GB message sizes) and processing samples
-                #   one-at-a-time is too slow (not much intra-operation parallelism)
-                #  The self.subbatch_size is a tuning parameter
-                my_shifted_components = []
-                sample_chunks = np.array_split(list(range(self.n_samples)),
-                                               self.n_samples //
-                                               self.subbatch_size)
-                for s_chunk in sample_chunks:
-                    # Get the shift values, tile to make ready for subtraction
-                    my_shift = tf.slice(self.shift,  # shape: (len(s_chunk),1 )
-                                        begin=(min(s_chunk), c),
-                                        size=(len(s_chunk), 1),
-                                        name=f'component_{c}-samples_'
-                                             f'{min(s_chunk)}-{max(s_chunk)}')
-                    my_shift = K.expand_dims(my_shift)
-                    my_shift = K.tile(my_shift, (1, 1, self.n_channels))
-
-                    # Compute the distance from each point
-                    k_matrix_tiled = K.tile(k_matrix, (len(s_chunk), 1, 1))
-                    distance_matrix = K.abs(k_matrix_tiled - my_shift)
-                    coeff_matrix = K.clip(1 - distance_matrix, 0, 1)
-
-                    # Compute the shift
-                    tiled_component = K.reshape(my_component,
-                                                (1, self.n_channels, 1))
-                    shifted_component = tf.matmul(coeff_matrix, tiled_component)
-                    my_shifted_components.append(K.squeeze(shifted_component, -1))
-
-                # Stack them to form: (n_samples, n_channels)
-                my_shifted_components = tf.concat(my_shifted_components, axis=0,
-                                                  name=f'shifted_components_{c}')
-
-                # Multiply by the contribution ot each sample
-                my_shifted_contribution = tf.multiply(
-                    my_shifted_components,
-                    K.expand_dims(my_contribution, -1)
-                )
-                shifted_components.append(tf.stack(my_shifted_contribution))
-
-            # Stacked array has a shape: (n_components, n_samples, n_channels)
-            self.shifted_contributions = tf.stack(shifted_components, 0,
-                                                  name='shifted_contributions')
-
-            # The total signal is the sum of all components
-            return K.sum(self.shifted_contributions, axis=0, keepdims=False)
-        else:
-            # Matrix multiply the contributes with the components
-            #  Contributions is: NS x NC
-            #  Components is: NC x NCh
-            # Result: NS x NCh
-            return K.dot(self.contributions, self.components)
+        total_signal, self.per_sample_contribution = generate_signals(
+            self.n_samples, self.n_components, self.n_channels,
+            self.contributions, self.components, self.shift)
+        return total_signal
 
     def get_contributions(self) -> np.ndarray:
+        """Get the contributions levels of each signal
+
+        Returns:
+            (ndarray) Contributions. Shape: n_samples, n_components
+        """
         return K.get_value(self.contributions)
 
     def get_components(self) -> np.ndarray:
+        """Get the learned components from the signal
+
+        Returns:
+            (ndarray) Components. Shape: n_components, n_channels
+        """
         return K.get_value(self.components)
+
+    def get_per_sample_contribution(self) -> np.ndarray:
+        """Get the contribution to the signal for each component for each sample
+
+        Returns:
+            (ndarray): Contributions: Shape: n_components, n_samples, n_channels
+        """
+        return K.get_value(self.per_sample_contribution)
 
 
 def run_training(factorizer: Model, signal: np.ndarray, max_epochs: int,
