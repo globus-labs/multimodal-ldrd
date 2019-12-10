@@ -39,7 +39,7 @@ def generate_signals(n_samples: int, n_components: int, n_channels: int,
         for k in range(-n_channels, n_channels, 1):
             kiu = np.triu_indices_from(k_matrix, k)
             k_matrix[kiu] = k
-        k_matrix = K.constant(k_matrix[None, :, :])
+        k_matrix = K.constant(k_matrix[None, :, :]) # Shape: 1, NCh, NCh
 
         # Compute the shifts from each component
         shifted_components = []
@@ -47,6 +47,9 @@ def generate_signals(n_samples: int, n_components: int, n_channels: int,
             # Get the component and the contribution
             my_component = components[c, :]  # shape: (n_channels)
             my_contribution = contributions[:, c]  # shape: (n_samples)
+
+            # Get the component in a ready to multiply form
+            tiled_component = K.reshape(my_component, (1, n_channels, 1))  # Shape: 1 x NCh x 1
 
             # Shift each individual components
             #  Note: We process samples in chunks because there are memory
@@ -59,22 +62,19 @@ def generate_signals(n_samples: int, n_components: int, n_channels: int,
                                            n_samples // subbatch_size)
             for s_chunk in sample_chunks:
                 # Get the shift values, tile to make ready for subtraction
-                my_shift = tf.slice(shift,  # shape: (len(s_chunk),1 )
+                my_shift = tf.slice(shift,  # shape: (len(s_chunk), 1)
                                     begin=(min(s_chunk), c),
                                     size=(len(s_chunk), 1),
                                     name=f'component_{c}-samples_'
                                          f'{min(s_chunk)}-{max(s_chunk)}')
-                my_shift = K.expand_dims(my_shift)
+                my_shift = K.expand_dims(my_shift)  # shape: NS' x 1 x 1
                 my_shift = K.tile(my_shift, (1, 1, n_channels))
 
                 # Compute the distance from each point
-                k_matrix_tiled = K.tile(k_matrix, (len(s_chunk), 1, 1))
-                distance_matrix = K.abs(k_matrix_tiled - my_shift)
+                distance_matrix = K.abs(tf.subtract(k_matrix, my_shift))  # Shape: NS' x NCh x NCh
                 coeff_matrix = K.clip(1 - distance_matrix, 0, 1)
 
                 # Compute the shift
-                tiled_component = K.reshape(my_component,
-                                            (1, n_channels, 1))
                 shifted_component = tf.matmul(coeff_matrix, tiled_component)
                 my_shifted_components.append(K.squeeze(shifted_component, -1))
 
