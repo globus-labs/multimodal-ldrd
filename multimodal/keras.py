@@ -8,7 +8,7 @@ from keras import backend as K
 from keras.layers import Layer
 from keras.constraints import NonNeg
 from keras.regularizers import Regularizer
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 
 def generate_signals(n_samples: int, n_components: int, n_channels: int,
@@ -233,7 +233,9 @@ class SingleModalFactorization(Layer):
     def call(self, inputs, **kwargs):
         total_signal, self.per_sample_contribution = generate_signals(
             self.n_samples, self.n_components, self.n_channels,
-            self.contributions, self.components, self.shift)
+            self.contributions, self.components, self.shift,
+            subbatch_size=self.subbatch_size
+        )
         return total_signal
 
     def get_contributions(self) -> np.ndarray:
@@ -261,7 +263,133 @@ class SingleModalFactorization(Layer):
         return K.get_value(self.per_sample_contribution)
 
 
-def run_training(factorizer: Model, signal: np.ndarray, max_epochs: int,
+class MultiModalFactorizer(Layer):
+    """Generates a multi-modal signal
+
+    This layer stores different components and shifts for each mode but has a single contribution
+    matrix for all modalities. The important point is that we learn component signals from all modalities
+    that are related to each other.
+    """
+
+    def __init__(self, n_components=2, fit_shift=False,
+                 component_regularizer=None, subbatch_size=32,
+                 contribution_regularizer=None,
+                 shift_regularizer=None,
+                 **kwargs):
+        """
+
+        Args:
+             n_components (int): Number of components to learn
+             fit_shift ([bool]): Whether to fit a shift for each component
+             component_regularizer (Regularizer): Regularizer for component signals
+             contribution_regularizer (Regularizer): Regularizer for the
+                contributions from component signals
+             shift_regularizer (Regularizer): Regularizer for the shift factors
+             subbatch_size (int): Number of samples to process concurrently
+        """
+        super().__init__(**kwargs)
+        self.n_components = n_components
+        self.fit_shift = fit_shift
+        self.component_regularizer = component_regularizer
+        self.contribution_regularizer = contribution_regularizer
+        self.shift_regularizer = shift_regularizer
+        self.subbatch_size = subbatch_size
+
+        # Placeholders for the weights
+        self.components = self.contributions = self.shift = None
+        self.per_sample_contribution = None
+
+        # Placeholders for input shape information
+        self.n_modes = self.n_samples = self.n_channels = None
+
+    def build(self, input_shape):
+        self.n_modes = len(input_shape)
+
+        # Create the learned components for each shape
+        self.n_channels = []
+        self.components = []
+        self.shift = []
+        for mode, (mode_shape, fit_shift) in enumerate(zip(input_shape, self.fit_shift)):
+            # Get the shape of this layer
+            assert not any(i is None for i in mode_shape), \
+                "Input shape must be completely specified"
+            self.n_samples, n_channels = mode_shape
+            self.n_channels.append(n_channels)
+
+            # Add the training weights
+            components = self.add_weight(
+                name=f'components_mode_{mode}',
+                shape=(self.n_components, n_channels),
+                constraint=NonNeg(),
+                initializer='uniform',
+                regularizer=self.component_regularizer
+            )
+            self.components.append(components)
+
+            # Make shift matrix, if needed
+            shift = None
+            if fit_shift:
+                shift = self.add_weight(
+                    name=f'shift_mode_{mode}',
+                    shape=(self.n_samples, self.n_components),
+                    initializer='uniform',
+                    regularizer=self.shift_regularizer,
+                )
+            self.shift.append(shift)
+
+        # We will have a single contribution matrix for all modes
+        self.contributions = self.add_weight(
+            name='contributions',
+            shape=(self.n_samples, self.n_components),
+            constraint=NonNeg(),
+            initializer='uniform',
+            regularizer=self.contribution_regularizer
+        )
+
+    def call(self, inputs, **kwargs):
+        self.per_sample_contribution = []
+        outputs = []
+        for n_channels, components, shift in zip(self.n_channels, self.components, self.shift):
+            total_signal, per_sample_signal = generate_signals(
+                self.n_samples, self.n_components, n_channels,
+                self.contributions, components, shift,
+                subbatch_size=self.subbatch_size
+            )
+            outputs.append(total_signal)
+            self.per_sample_contribution.append(per_sample_signal)
+        return outputs
+
+    def get_contributions(self) -> np.ndarray:
+        """Get the contributions levels of each component
+
+        Returns:
+            (ndarray) Contributions. Shape: n_samples, n_components
+        """
+        return K.get_value(self.contributions)
+
+    def get_components(self, mode: int) -> np.ndarray:
+        """Get the learned components from the signal
+
+        Args:
+            mode (int): Which mode
+        Returns:
+            (ndarray) Components. Shape: n_components, n_channels
+        """
+        return K.get_value(self.components[mode])
+
+    def get_per_sample_contribution(self, mode: int) -> np.ndarray:
+        """Get the contribution to the signal for each component for each sample
+
+        Args:
+            mode (int): Which mode
+        Returns:
+            (ndarray): Contributions: Shape: n_components, n_samples, n_channels
+        """
+        return K.get_value(self.per_sample_contribution[mode])
+
+
+def run_training(factorizer: Model, signal: Union[np.ndarray, List[np.ndarray]],
+                 max_epochs: int,
                  steps_per_epoch: int = 8,
                  early_stopping_patience: int = 20,
                  early_stopping_tolerance: float = 1e-6,
@@ -281,7 +409,13 @@ def run_training(factorizer: Model, signal: np.ndarray, max_epochs: int,
     Returns:
         (pd.DataFrame) Loss as a function of epoch
     """
-    signal_tensor = K.variable(signal)  # Convert to Tensor for efficiency
+    # Convert to Tensor for efficiency
+    if isinstance(signal, np.ndarray):
+        signal_tensor = K.variable(signal)
+        single_output = True
+    else:
+        signal_tensor = [K.variable(s) for s in signal]
+        single_output = False
 
     # Run the training
     losses = []
@@ -294,6 +428,10 @@ def run_training(factorizer: Model, signal: np.ndarray, max_epochs: int,
         # Run an epoch
         for _ in range(steps_per_epoch):
             loss = factorizer.train_on_batch(signal_tensor, signal_tensor)
+
+        # Get only the entire loss
+        if not single_output:
+            loss = loss[0]
         losses.append(loss)
 
         # Store the best loss
